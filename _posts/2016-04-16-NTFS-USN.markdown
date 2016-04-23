@@ -1,0 +1,428 @@
+---
+layout: post
+title:  "NTFS USN日志记录读取历险记"
+subtitle:   ""  
+date:       2016-04-16
+author:     "allanruin"
+header-img: "img/posthead/post-bg-js-module.jpg"
+header-mask: 0.5
+catalog: true
+tags:
+    - NTFS
+    - USN
+    - 坑
+
+---
+
+这篇文章是我2016年，在windows10（1024版本） 下读取NTFS分区的日记条目的记录。网上大部分关于读取USN的博客都是几年前的东西，我记录自己遇到的一些坑和中文内容里比较少人提到的一些quirk的行为。希望我的这篇博文能为试图使用NTFS日志功能的朋友提供一些帮助。
+
+# NTFS预备知识
+
+NTFS文件系统，是现在windows操作系统下最常见的文件系统了（旧电脑可能还经常能见到FAT32文件系统）。从Windows NT 3.1(Windows XP)开始，NTFS就作为NT系列操作系统的默认文件系统。NTFS文件系统支持日志操作，既对文件和目录等文件系统对象的操作（新增、删除、修改等）都会在$LogFile和$UsnJrnl文件中。每条记录表明什么对象进行了何种改变。￥logFile文件记录了一些redo和undo信息，有助于系统崩溃时让文件系统得到修复，对logFile方面，微软几乎没有公开信息。反之对USN Journal微软有官方的详细API记录和数据结构解释。USN Journal可以认为是一个对用户更友好的日志。为了保留空间，旧日志可能会被删除。注意USN日志并没有记录具体的操作数据，所以我们并不能通过USN日志对数据进行还原。
+
+# 关于日志USN
+USN（Update Sequence Number），更新序号。因为日志记录是作为一个数据流（Stream）的方式不断添加到日志流末端，所以USN Journal在实现的时候是以记录的偏移作为标识符，即USN。在执行文件关闭前，对同一个文件的多个操作只会留下一个USN记录。
+
+USN的结构如下：
+![](/img/in-post/USN_RECORD_STRUCT.png)
+
+# 概念与数据结构
+
+下面这些就是操作USN日志会用到的函数。这里我们主要是读取日志记录，所以`DeviceIoControl`中右边三个就忽略不做介绍了。
+![](/img/in-post/USN_FUNCTIONS.png)
+
+
+## DeviceIoControl
+
+NTFS操作系统中每个卷都有自己的USN日志，对USN的相关操作都是通过`DeviceIoControl`进行。DeivceIoControl直接发送操作码给特定的设备驱动，让设备执行相应的操作。它的原型长这样：
+
+~~~ C
+BOOL WINAPI DeviceIoControl(
+  _In_        HANDLE       hDevice,
+  _In_        DWORD        dwIoControlCode,
+  _In_opt_    LPVOID       lpInBuffer,
+  _In_        DWORD        nInBufferSize,
+  _Out_opt_   LPVOID       lpOutBuffer,
+  _In_        DWORD        nOutBufferSize,
+  _Out_opt_   LPDWORD      lpBytesReturned,
+  _Inout_opt_ LPOVERLAPPED lpOverlapped
+);
+~~~
+
+因为这个函数是非常通用的跟设备交互的函数，所以第一眼看上去非常不顺眼，不过习惯就好。原型里的`_In_Opt_`、`_In_`等是微软的[源码注解语言](https://msdn.microsoft.com/en-us/library/ms235402.aspx)，`_In_Opt_`表示我们可以传NULL进去。当然实际我们使用的时候不需要看这个`DeviceIoControl`的原型，直接看相应操作码的文档页就好。
+
+
+## 获取句柄
+
+因为`DeviceIoControl`是针对卷的，所以为了使用`DeviceIoControl`，我们需要卷设备的句柄（HANDLE）。所以上面那个图我写上了`CreateFile`,通过CreateFile可以获得普通分区（卷）的句柄。这里要注意
+
+>For file I/O, the "\\\\?\\" prefix to a path string tells the Windows APIs to disable all string parsing and to send the string that follows it straight to the file system. For example, if the file system supports large paths and file names, you can exceed the MAX_PATH limits that are otherwise enforced by the Windows APIs
+
+>The "\\\\.\\" prefix will access the Win32 device namespace instead of the Win32 file namespace. This is how access to physical disks and volumes is accomplished directly, without going through the file system, if the API supports this type of access. You can access many devices other than disks this way 
+
+
+
+`\\.\`是win32的设备名字空间，通过这种前缀我们可以绕过文件系统直接跟物理设备交互。但是要注意字符串的反斜杠转义，所以实际使用的时候往往是这样的`L"\\\\.\\C:"`. 获取分区的代码示例如下：
+
+~~~ C
+HANDLE getVolumeHandle(PWCHAR vol) {
+	// vol should be like L"\\\\.\\C:"
+	HANDLE h = CreateFile(vol,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_WRITE | FILE_SHARE_READ,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+
+	if (h == INVALID_HANDLE_VALUE) {
+		printf("INVALID_HANDLE_VALUE error:%d\n", GetLastError());
+		exit(1);
+	}
+	return h;
+}
+~~~
+
+## FSCTL_QUERY_USN_JOURNAL
+
+使用这个操作码时，我们将在`DeviceIoControl`的out_buffer得到一个`USN_JOURNAL_DATA_V0` 或者 `USN_JOURNAL_DATA_V1` 或者`USN_JOURNAL_DATA_V2` 结构体。`USN_JOURNAL_DATA`表征了卷日志的一些信息，如日志文件的ID，大小，容量，版本号等。其结构如下：
+
+~~~ C
+typedef struct {
+  DWORDLONG UsnJournalID;
+  USN       FirstUsn;
+  USN       NextUsn;
+  USN       LowestValidUsn;
+  USN       MaxUsn;
+  DWORDLONG MaximumSize;
+  DWORDLONG AllocationDelta;
+  WORD      MinSupportedMajorVersion;
+  WORD      MaxSupportedMajorVersion;
+  DWORD     Flags;
+  DWORDLONG RangeTrackChunkSize;
+  LONGLONG  RangeTrackFileSizeThreshold;
+} USN_JOURNAL_DATA_V2, *PUSN_JOURNAL_DATA_V2;
+~~~ 
+
+`FirstUsn`是第一条USN号，`NextUsn`是系统下一条日志将写到的位置的USN号（其实就是现有的最大的USN的下一位USN）。比较有意思的`Flags`表示range tracking是否启用。0x00000000表示没有启用，0x00000001表示启用。
+
+~~~ C
+DWORDLONG getJournalID(HANDLE h, PUSN_JOURNAL_DATA jd ) {
+	DWORD dwBytes = 0;
+	if (!DeviceIoControl(h,
+		FSCTL_QUERY_USN_JOURNAL,
+		NULL,
+		0,
+		jd,
+		sizeof(USN_JOURNAL_DATA),
+		&dwBytes,
+		NULL))
+	{
+		printf("Query journal failed (%d)\n", GetLastError());
+		exit(1);
+	}
+}
+~~~
+
+## FSCTL_ENUM_USN_DATA
+执行`FSCTL_ENUM_USN_DATA`操作，需要给`DeviceIoControl`的参数`MFT_ENUM_DATA_V1`,其结构体定义如下：
+
+~~~ C
+typedef struct {
+  DWORDLONG StartFileReferenceNumber;
+  USN       LowUsn;
+  USN       HighUsn;
+  WORD      MinMajorVersion;
+  WORD      MaxMajorVersion;
+} MFT_ENUM_DATA_V1, *PMFT_ENUM_DATA_V1;
+~~~
+
+`StartFileReferenceNumber`，微软是这么解释的
+
+>The ordinal position within the files on the current volume at which the enumeration is to begin.
+
+其实就是进行遍历操作时从哪个USN开始。第一次`FSCTL_ENUM_USN_DATA`操作必须将其设为0。
+
+`LowUsn`、`HighUsn`：USN范围的上、下限，用于过滤需要返回的USN记录。只有最后一次USN处在`LowUsn`和`HighUsn`之间的文件的USN记录才会被返回。 
+
+这里其实有点奇怪，既然搜索从`StartFileReferenceNumber`开始，还需要`LowUsn`干啥，下限就是`StartFileReferenceNumber`不就得了。下一小节提到的`READ_USN_JOURNAL_DATA_V1 `就正常多了，有个`StartUsn`表示查询的开始，但是`READ_USN_JOURNAL_DATA_V1`连上限都没有，就这么一直查到底么=_=. 这两个查询方式的设计思路感觉真是不一样啊，`FSCTL_ENUM_USN_DATA`甚至不需要`UsnJournalID`。。
+
+
+~~~ C
+	MFT_ENUM_DATA edata{
+		0, // StartFileReferenceNumber
+		0, // LowUsn
+		jd->NextUsn, //HighUsn
+		jd->MinSupportedMajorVersion,
+		version // here is the interesting point cause incompatible behaviour
+	};
+	printf("MaxSupportedMajorVesion=%lu\n", jd->MaxSupportedMajorVersion);
+
+	const int BUF_LEN = 0x10000;
+	CHAR Buffer[BUF_LEN];
+	DWORD rbytes = 0;
+	ULONGLONG dirCnt = 0L;
+	ULONGLONG fileCnt = 0L;
+	ULONGLONG cnt = 0L;
+	while (DeviceIoControl(h, FSCTL_ENUM_USN_DATA, &edata, sizeof(edata),
+		&Buffer, BUF_LEN, &rbytes, NULL)) {
+
+		// update  LowUsn to edata for next call 
+		edata.StartFileReferenceNumber = *(USN*)Buffer;
+		rbytes -= sizeof(USN);
+
+
+		PUSN_RECORD prec = (PUSN_RECORD)(Buffer + sizeof(USN));
+		while (rbytes > 0) {
+			cnt += 1;
+
+			wprintf(L"name=%.*s\n", prec->FileNameLength / 2, prec->FileName);
+			rbytes -= prec->RecordLength;
+			prec = (PUSN_RECORD)(((PBYTE)prec) + prec->RecordLength);
+
+		} // end buffer while
+	} // end outer while
+
+	printf("number of record scanned=%lu\n", cnt);
+~~~
+
+
+## FSCTL_READ_USN_JOURNAL
+
+``` C 
+typedef struct {
+  USN       StartUsn;
+  DWORD     ReasonMask;
+  DWORD     ReturnOnlyOnClose;
+  DWORDLONG Timeout;
+  DWORDLONG BytesToWaitFor;
+  DWORDLONG UsnJournalID;
+  WORD      MinMajorVersion;
+  WORD      MaxMajorVersion;
+} READ_USN_JOURNAL_DATA_V1, *PREAD_USN_JOURNAL_DATA_V1;
+``` 
+
+`ReasonMask`可以选择过滤需要的USN记录类型。  
+`UsnJournalID`，跟`FSCTL_ENUM_USN_DATA`不同，这里需要UsnJournal的ID了，为什么这里就需要了呢？  
+`ReturnOnlyOnClose`，选择是否在文件关闭的时候才接收信息。因为关闭之前同一个文件的USN记录可能被不断更新改写。  
+
+
+`FSCTL_READ_USN_JOURNAL`跟`FSCTL_ENUM_USN_DATA`非常相似，就是给`DeviceIoControl`的参数不一样。
+
+``` C 
+	const int BUF_LEN = 0x10000;
+	CHAR Buffer[BUF_LEN];
+	DWORD rbytes = 0;
+	ULONGLONG cnt = 0L;
+
+
+	READ_USN_JOURNAL_DATA ReadData = { 0, 0xFFFFFFFF, FALSE, 0, 0 };
+	ReadData.UsnJournalID = jd->UsnJournalID;
+	ReadData.MinMajorVersion = jd->MinSupportedMajorVersion;
+	ReadData.MaxMajorVersion = 2;
+
+	while (DeviceIoControl(h, FSCTL_READ_USN_JOURNAL, &ReadData, sizeof(ReadData),
+		&Buffer, BUF_LEN, &rbytes, NULL)) {
+
+		// here is different to ENUM method, in ENUM
+		// with set StartFileReferenceNumber, here we update
+		// StartUsn, I think StartUsn make more sense.
+		ReadData.StartUsn = *(USN*)Buffer;
+		rbytes -= sizeof(USN);
+
+
+		PUSN_RECORD prec = (PUSN_RECORD)(Buffer + sizeof(USN));
+		while (rbytes > 0) {
+			cnt += 1;
+			printf("reason=%lu,time=%lu,srcinfo=%lu\n", prec->Reason, prec->TimeStamp, prec->SourceInfo);
+			//wprintf(L"name=%.*s\n", prec->FileNameLength / 2, prec->FileName);
+			rbytes -= prec->RecordLength;
+			prec = (PUSN_RECORD)(((PBYTE)prec) + prec->RecordLength);
+
+		} // end buffer while
+	} // end outer while
+
+	printf("number of record scanned=%lu\n", cnt);
+```
+
+# Reason、Timestamp、SourceInfo
+
+1. FSCTL_READ_USN_JOURNAL
+2. FSCTL_ENUM_USN_DATA
+3. FSCTL_READ_FILE_USN_DATA 
+
+第三种方法是最新添加的，在`FSCTL_READ_FILE_USN_DATA`评论里注明了该方法得到的USN_RECORD里的Reason、Timestamp、SourceInfo成员都是invalid的。然而实验我们可以发现，其实`FSCTL_ENUM_USN_DATA`遍历得到的US_RECORD也是invalid的。
+效果如图：![](/img/in-post/three_way_read_USN.png)
+
+
+# 实践中的坑
+
+## 管理员权限
+读取分区需要管理员权限，为了方便开发和调试，建议以管理员权限打开visual studio，并且在项目->属性里做如下图的设置：
+![](/img/in-post/run_as_admin_project.png)
+没有管理权限的话，在获取分区句柄的`CreateFile`函数就会失败返回`INVALID_HANDLE_VALUE`。
+
+
+## 版本号引起的结果错乱
+`MFT_ENUM_DATA` 结构体[定义](https://msdn.microsoft.com/en-us/library/windows/desktop/hh802704(v=vs.85).aspx)如下：
+
+~~~ c
+typedef struct {
+  DWORDLONG StartFileReferenceNumber;
+  USN       LowUsn;
+  USN       HighUsn;
+  WORD      MinMajorVersion;
+  WORD      MaxMajorVersion;
+} MFT_ENUM_DATA_V1, *PMFT_ENUM_DATA_V1;
+~~~
+
+注意上面这个其实是`MFT_ENUM_DATA_V1`的结构，以前的V0版本是没有`MinMajorVersion`和`MaxMajorVersion`的。在`winioctl.h`文件中
+有个`typedef`，NTDDI版本大于WIN8的就是V1，小于就是V0。
+
+~~~ C
+#if (NTDDI_VERSION >= NTDDI_WIN8)
+typedef MFT_ENUM_DATA_V1 MFT_ENUM_DATA, *PMFT_ENUM_DATA;
+#else
+typedef MFT_ENUM_DATA_V0 MFT_ENUM_DATA, *PMFT_ENUM_DATA;
+#endif
+~~~
+
+前面提到了，我们已经先查询得到了`USN_JOURNAL_DATA`结构，回顾一下结构体[定义](https://msdn.microsoft.com/en-us/library/windows/desktop/mt684960(v=vs.85).aspx)如下:
+
+~~~ C
+typedef struct {
+  DWORDLONG UsnJournalID;
+  USN       FirstUsn;
+  USN       NextUsn;
+  USN       LowestValidUsn;
+  USN       MaxUsn;
+  DWORDLONG MaximumSize;
+  DWORDLONG AllocationDelta;
+  // The minimum version of the USN change journal that the file system supports.
+  WORD      MinSupportedMajorVersion;
+  //The maximum version of the USN change journal that the file system supports.
+  WORD      MaxSupportedMajorVersion;
+  DWORD     Flags;
+  DWORDLONG RangeTrackChunkSize;
+  LONGLONG  RangeTrackFileSizeThreshold;
+} USN_JOURNAL_DATA_V2, *PUSN_JOURNAL_DATA_V2;
+~~~
+
+里面就有`MinSupportedMajorVersion`，`MaxSupportedMajorVersion`,于是很自然我就把这里的`MaxSupportedMajorVersion`给赋值给`MFT_ENUM_DATA`的`MaxMajorVersion`了。我直接在实体机win10上写的代码，实际上返回的文件系统最大支持大版本号为4，我又将其赋值给了
+MaxMajorVersion，那么下一步我把这个`MFT_ENUM_DATA`结构作为参数传给执行FSCTL_ENUM_USN_DATA命令的`DeviceIoControl( )`函数。我当时天真的用`PUSN_RECORD`去访问结果所在的BUFFER，结果得到的每条记录的文件名都是空的，而且USN记录的reason的数值也都是些
+未定义的数值。
+
+![](/img/in-post/wrong_usn_record_version_read.png)
+
+当时也是一脸懵逼，怀疑是什么指针转换操作的时候加的偏移出错了。一直找一直找，不知道到底什么破问题。当时我也看了`PUSN_RECORD`的定义：
+
+~~~ CPP
+typedef USN_RECORD_V2 USN_RECORD, *PUSN_RECORD;
+~~~
+
+我的想法是，我用的这么新的操作系统，一般都会定义成目前支持的最新的版本吧，也咩有想到这里定义的是一个非常保守的版本号。我再解释一下，当告诉调用FSCTL_ENUM_USN_DATA的时候，说最大支持主版本4，返回的结构其实会是：
+
+~~~ CPP
+typedef struct {
+    USN_RECORD_COMMON_HEADER Header;
+    FILE_ID_128 FileReferenceNumber;
+    FILE_ID_128 ParentFileReferenceNumber;
+    USN Usn;
+    DWORD Reason;
+    DWORD SourceInfo;
+    DWORD RemainingExtents;
+    WORD   NumberOfExtents;
+    WORD   ExtentSize;
+    USN_RECORD_EXTENT Extents[1];
+} USN_RECORD_V4, *PUSN_RECORD_V4;
+~~~
+
+大家对比一下，上面这个V4的`USN_RECORD`结构体和下面这两个V2和V3的成员。V2和V3的结构成员是一模一样的！（至少目前2016.4.16为止是这样）。
+
+~~~ CPP
+typedef struct {
+
+    DWORD RecordLength;
+    WORD   MajorVersion;
+    WORD   MinorVersion;
+    DWORDLONG FileReferenceNumber;
+    DWORDLONG ParentFileReferenceNumber;
+    USN Usn;
+    LARGE_INTEGER TimeStamp;
+    DWORD Reason;
+    DWORD SourceInfo;
+    DWORD SecurityId;
+    DWORD FileAttributes;
+    WORD   FileNameLength;
+    WORD   FileNameOffset;
+    WCHAR FileName[1];
+
+} USN_RECORD_V2, *PUSN_RECORD_V2;
+
+typedef struct {
+
+    DWORD RecordLength;
+    WORD   MajorVersion;
+    WORD   MinorVersion;
+    FILE_ID_128 FileReferenceNumber;
+    FILE_ID_128 ParentFileReferenceNumber;
+    USN Usn;
+    LARGE_INTEGER TimeStamp;
+    DWORD Reason;
+    DWORD SourceInfo;
+    DWORD SecurityId;
+    DWORD FileAttributes;
+    WORD   FileNameLength;
+    WORD   FileNameOffset;
+    WCHAR FileName[1];
+
+} USN_RECORD_V3, *PUSN_RECORD_V3;
+~~~
+
+但V4有较大的变动，V4的没有`FileNameLength`、`FileName`和`FileNameOffset`这些跟文件名字有关的属性，多了`USN_RECORD_EXTENT`结构。我以为当我设置主版本号为4时，返回给我的是许多`USN_RECORD_V4`，然而细看[文档](https://msdn.microsoft.com/en-us/library/windows/desktop/mt684964(v=vs.85).aspx)发觉好像不是这样。文档提到
+
+>A USN_RECORD_V4 record is only output when range tracking is turned on and the file size is equal or larger than the value of the RangeTrackFileSizeThreshold member. The user always receives one or more USN_RECORD_V4 records followed by one USN_RECORD_V3 record.
+
+>The number of extents that remain after the current USN_RECORD_V4 record. Multiple version 4.0 records may be required to describe all of the modified extents for a given file. When the RemainingExtents member is 0, the current USN_RECORD_V4 record is the last USN_RECORD_V4 record for the file. The last USN_RECORD_V4 entry for a given file is always followed by a USN_RECORD_V3 record with at least the USN_REASON_CLOSE flag set.
+
+就是说启用了NTFS日志的range tracking功能，且一个文件的大小等于或超过`RangeTrackFileSizeThreshold`指定的大小时，才会返回V4的USER_RECORD结构体。并且这一组V4结构体最终肯定会跟随者一个V3的USER_RECORD。就是说一个文件对于的日志记录将是这么构成的：
+![](/img/in-post/large_v4_USN.png)
+
+于是在整个BUFFER里将形成这样的结构：![](/img/in-post/whole_buffer_with_v234.png)
+
+那么问题就来了，有V2、V3、V4几个版本的USN_RECORD混在一起我怎么知道现在指向的是什么版本的结构体？尤其可疑的是V4没有RecordLength成员。仔细看，有个`USN_RECORD_COMMON_HEADER`,
+
+>A USN_RECORD_COMMON_HEADER structure that describes the record length, major version, and minor version for the record.
+
+~~~ C
+typedef struct _USN_RECORD_COMMON_HEADER {
+  DWORD RecordLength;
+  WORD  MajorVersion;
+  WORD  MinorVersion;
+} USN_RECORD_COMMON_HEADER, *PUSN_RECORD_COMMON_HEADER;
+~~~
+
+这里所谓range tracking我理解是对一个超过域值的文件，记录对其一定范围内的修改都做记录，而不只是记录整个文件被修改。
+微软的[文档](https://msdn.microsoft.com/en-us/library/windows/desktop/dn302075(v=vs.85).aspx)这么说到：
+
+>The NT File System (NTFS) team has added a new feature to Windows. USN Journal will output an update sequence number (USN) record containing modified ranges for a file upon close. A new record type, USN_RECORD_V4 has been introduced to record these changed ranges of a file.
+
+>All existing applications that use USN Journal will continue to work well without any compatibility issues.
+
+说得好听，实际可以看到设置值不为2的版本号，遍历都会出问题，兼容个蛋蛋。
+
+那么问题来了，我们怎么知道range tracking有没有开启呢？~~del目前并没有看到哪个函数可以查询这点。~~FSCTL_QUERY_USN_JOURNAL部分有个flag可以指明是否启用了range tracking.微软说
+
+>Once range tracking is enabled for a given volume it cannot be disabled except by deleting the USN Journal and recreating it.
+
+
+# 参考资料
+
+[1]http://rp.delaat.net/2015-2016/p18/report.pdf
+[2]http://microsoft.public.win32.programmer.kernel.narkive.com/2qwNWNxp/enumerating-the-usn-journal
+[3]https://www.microsoft.com/msj/0999/journal/journal.aspx
+[4]https://msdn.microsoft.com/en-us/library/windows/desktop/aa363803(v=vs.85).aspx
+
+关于微软的命名空间：   
+[5]https://msdn.microsoft.com/en-us/library/aa365247(v=vs.85).aspx#paths
+[6]https://msdn.microsoft.com/en-us/library/windows/desktop/aa365248(v=vs.85).aspx

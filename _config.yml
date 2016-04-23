@@ -1,0 +1,83 @@
+# Site settings
+title: Algoland
+SEOTitle: Irix的博客 | Irix's Blog
+header-img: img/home-bg.jpg
+email: irixruin@gmail.com
+description: "关于技术与编程、黑客与极客"
+keyword: "irix, allanruin, 算法, 技术"
+url: "http://www.irix.me"              # your host, for absolute URL
+baseurl: ""                             # for example, '/blog' if your blog hosted on 'host/blog'
+
+
+
+# SNS settings
+RSS: false
+weibo_username:     Allan已经毕业了
+#zhihu_username:     figofuture
+github_username:    allanruin
+twitter_username:   allanruin
+#facebook_username:  figofuture
+
+
+
+# Build settings
+highlighter: rouge
+permalink: pretty
+paginate: 10
+exclude: ["less","node_modules","Gruntfile.js","package.json","README.md","README.zh.md"]
+anchorjs: true                          # if you want to customize anchor. check out line:181 of `post.html`
+
+# Gems
+# from PR#40, to support local preview for Jekyll 3.0
+gems: [jekyll-paginate]
+
+# Markdown settings
+# replace redcarpet to kramdown,
+# although redcarpet can auto highlight code, the lack of header-id make the catalog impossible, so I switch to kramdown
+# document: http://jekyllrb.com/docs/configuration/#kramdown
+markdown: kramdown
+kramdown:
+  input: GFM                            # use Github Flavored Markdown !important
+
+
+
+# Disqus settings
+disqus_username: allanruin
+
+# Duoshuo settings
+duoshuo_username: 
+# Share component is depend on Comment so we can NOT use share only.
+duoshuo_share: false                     # set to false if you want to use Comment without Sharing
+
+
+
+
+# Analytics settings
+# Baidu Analytics
+#ba_track_id: 5ca3b4a871144d40191d580b938bfe34 
+# Google Analytics
+#ga_track_id: 'UA-70990229-1'            # Format: UA-xxxxxx-xx
+ga_domain: irix.me
+
+
+
+# Sidebar settings
+sidebar: true                           # whether or not using Sidebar.
+sidebar-about-description: "记录技术坑和算法迷思~"
+sidebar-avatar: /img/xbx_head.jpeg      # use absolute URL, seeing it's used in both `/` and `/about/`
+
+
+
+# Featured Tags
+featured-tags: true                     # whether or not using Feature-Tags
+featured-condition-size: 1              # A tag will be featured if the size of it is more than this condition value
+
+
+
+# Friends
+friends: [
+    {
+        title: "百步梯",
+        href:  "http://www.100steps.net"
+    }
+]
